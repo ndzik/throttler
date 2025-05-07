@@ -35,6 +35,7 @@ import Network.HTTP.Types
 import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.WebSockets qualified as WaiWS
+import Network.WebSockets (ConnectionException)
 import Network.WebSockets qualified as WS
 import System.Environment (getArgs)
 import System.Random
@@ -52,6 +53,7 @@ data ProxyConfig = ProxyConfig
   { _targetKbps :: TVar Int,
     _dropPct :: TVar Int,
     _disconnectPct :: TVar Int,
+    _chunkSize :: Int,
     _port :: Int
   }
 
@@ -61,41 +63,49 @@ type AppM = ReaderT ProxyConfig IO
 
 -- * Throttle Logic
 
-throttledRequestBody :: IO B.ByteString -> Int -> AppM BL.ByteString
-throttledRequestBody getChunk chunkSize = go []
+data SimulatedExceptions = SimulatedDisconnect | SimulatedDrop deriving (Show)
+
+instance Exception SimulatedExceptions
+
+throttledRequestBody :: IO B.ByteString -> AppM BL.ByteString
+throttledRequestBody getChunk = go []
   where
     mkDelay cs kb = (cs * 8 * 1_000_000) `div` max 1 (kb * 1000)
-
     go acc = do
       chunk <- liftIO getChunk
       cfg <- ask
       kbps <- liftIO $ readTVarIO (cfg ^. targetKbps)
-      pct <- liftIO $ readTVarIO (cfg ^. dropPct)
       dis <- liftIO $ readTVarIO (cfg ^. disconnectPct)
+      let chunkSz = cfg ^. chunkSize
       if B.null chunk
         then return (BL.fromChunks (reverse acc))
         else do
-          let delay = mkDelay chunkSize kbps
+          let delay = mkDelay chunkSz kbps
           r <- liftIO $ randomRIO (0, 99 :: Int)
           liftIO $ threadDelay delay
           when (r < dis) $ do
             -- Forcefully disconnect by crashing the connection.
-            liftIO $ throwIO $ userError "Simulated disconnect"
-          let acc' = if r < pct then acc else chunk : acc
-          go acc'
+            liftIO $ throwIO SimulatedDisconnect
+          go $ chunk : acc
 
 -- * Proxy Server
 
 runProxyServer :: String -> BChan AppEvent -> ProxyConfig -> IO ()
 runProxyServer upstreamHost chan cfg = do
   manager <- HC.newManager HC.tlsManagerSettings
-  -- atomicallyLog chan $ "Starting throttled proxy on " <> (T.pack . show $ port) <> " forwarding requests to " <> T.pack upstreamHost
-  run (cfg ^. port) $ WaiWS.websocketsOr WS.defaultConnectionOptions (wsApp upstreamHost cfg) (app upstreamHost manager cfg chan)
+  run (cfg ^. port) $ WaiWS.websocketsOr WS.defaultConnectionOptions (wsApp upstreamHost chan cfg) (app upstreamHost manager cfg chan)
 
 -- * WAI Application
 
 app :: String -> HC.Manager -> ProxyConfig -> BChan AppEvent -> Wai.Application
-app upstreamHost manager cfg chan req respond = runReaderT (app' upstreamHost manager chan req respond) cfg
+app upstreamHost manager cfg chan req respond =
+  runReaderT (app' upstreamHost manager chan req respond) cfg `catch` \case
+    SimulatedDisconnect -> do
+      atomicallyLog chan "[Simulated] Forced client disconnect"
+      respond $ Wai.responseLBS status408 corsHeaders "Simulated broken pipe"
+    SimulatedDrop -> do
+      atomicallyLog chan "[Simulated] Forced client disconnect"
+      respond $ Wai.responseLBS status408 corsHeaders "Simulated broken pipe"
 
 app' :: String -> HC.Manager -> BChan AppEvent -> Wai.Request -> (Wai.Response -> IO Wai.ResponseReceived) -> AppM Wai.ResponseReceived
 app' upstreamHost manager chan req respond
@@ -110,8 +120,13 @@ app' upstreamHost manager chan req respond
 
       liftIO . atomicallyLog chan $ "[Request] " <> T.pack (B.unpack (Wai.requestMethod req)) <> " " <> T.pack rawPath <> T.pack rawQuery
 
-      let chunkSize = 1024
-      body <- throttledRequestBody (Wai.getRequestBodyChunk req) chunkSize
+      -- Simulate full connection drop.
+      cfg <- ask
+      dropHood <- liftIO $ readTVarIO (cfg ^. dropPct)
+      dropRoll <- liftIO $ randomRIO (0, 99 :: Int)
+      when (dropRoll < dropHood) $ liftIO . throwIO $ SimulatedDrop
+
+      body <- throttledRequestBody (Wai.getRequestBodyChunk req)
 
       initReq <- HC.parseRequest fullURL
       let filteredHeaders = filter (\(h, _) -> CI.foldedCase h `notElem` ["host", "content-length"]) (Wai.requestHeaders req)
@@ -139,14 +154,15 @@ app' upstreamHost manager chan req respond
               headers = HC.responseHeaders resp
               rawRespBody = HC.responseBody resp
 
+          let ourHost = "http://127.0.0.1:" <> show (cfg ^. port)
           liftIO . respond $
             Wai.mapResponseHeaders (++ corsHeaders) $
-              Wai.responseLBS status (rewriteLocationHeader upstreamHost "http://127.0.0.1:8888" $ stripCorsHeaders headers) rawRespBody
+              Wai.responseLBS status (rewriteLocationHeader upstreamHost ourHost $ stripCorsHeaders headers) rawRespBody
 
 -- * WebSocket passthrough
 
-wsApp :: String -> ProxyConfig -> WS.ServerApp
-wsApp upstreamUrl cfg pending = do
+wsApp :: String -> BChan AppEvent -> ProxyConfig -> WS.ServerApp
+wsApp upstreamUrl chan cfg pending = do
   let req = WS.pendingRequest pending
       headers = WS.requestHeaders req
       path = WS.requestPath req
@@ -156,7 +172,15 @@ wsApp upstreamUrl cfg pending = do
   connClient <- WS.acceptRequest pending
   let (upstreamHost, upstreamPort) = toHostPort upstreamUrl
 
-  WS.runClient upstreamHost upstreamPort (B8.unpack fullPath) $ \connUpstream -> runReaderT (wsApp' connClient connUpstream) cfg
+  -- Run upstream connection and log disconnection errors.
+  WS.runClient
+    upstreamHost
+    upstreamPort
+    (B8.unpack fullPath)
+    ( \connUpstream ->
+        runReaderT (wsApp' connClient connUpstream) cfg
+    )
+    `catch` (\(_ :: ConnectionException) -> atomicallyLog chan "[WebSocket] Upstream connection closed")
 
 wsApp' :: WS.Connection -> WS.Connection -> AppM ()
 wsApp' connClient connUpstream =
@@ -380,6 +404,7 @@ main = do
               { _targetKbps = rv,
                 _dropPct = dpct,
                 _disconnectPct = dv,
+                _chunkSize = 1024,
                 _port = 8888
               }
       _ <- forkIO $ runProxyServer host chan conf
