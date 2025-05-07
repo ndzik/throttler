@@ -3,18 +3,19 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 module Main (main) where
 
 import Brick
 import Brick.BChan (BChan, newBChan, writeBChan)
-import Brick.Focus (focusGetCurrent)
+import Brick.Util qualified as BU
 import Brick.Widgets.Border
 import Brick.Widgets.Edit
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (race_)
 import Control.Concurrent.STM
-import Control.Exception (catch)
+import Control.Exception
 import Control.Lens (makeLenses, (%~), (.~), (^.))
 import Control.Monad.Reader
 import Data.Bifunctor (first)
@@ -50,6 +51,7 @@ data AppEvent
 data ProxyConfig = ProxyConfig
   { _targetKbps :: TVar Int,
     _dropPct :: TVar Int,
+    _disconnectPct :: TVar Int,
     _port :: Int
   }
 
@@ -59,21 +61,28 @@ type AppM = ReaderT ProxyConfig IO
 
 -- * Throttle Logic
 
-throttleChunks :: Int -> Int -> B.ByteString -> IO BL.ByteString
-throttleChunks kbps pct body = do
-  let chunkSize = 1024
-      delay = (chunkSize * 8 * 1_000_000) `div` (kbps * 1000)
-      chunks = chunkBody chunkSize body
-  BL.concat <$> mapM (throttleOne delay pct) chunks
+throttledRequestBody :: IO B.ByteString -> Int -> AppM BL.ByteString
+throttledRequestBody getChunk chunkSize = go []
   where
-    chunkBody n bs
-      | B.null bs = []
-      | otherwise = let (c, rest) = B.splitAt n bs in c : chunkBody n rest
+    mkDelay cs kb = (cs * 8 * 1_000_000) `div` max 1 (kb * 1000)
 
-    throttleOne d _pct bs = do
-      dropChance <- randomRIO (0, 99 :: Int)
-      threadDelay d
-      return $ if dropChance < _pct then BL.empty else BL.fromStrict bs
+    go acc = do
+      chunk <- liftIO getChunk
+      cfg <- ask
+      kbps <- liftIO $ readTVarIO (cfg ^. targetKbps)
+      pct <- liftIO $ readTVarIO (cfg ^. dropPct)
+      dis <- liftIO $ readTVarIO (cfg ^. disconnectPct)
+      if B.null chunk
+        then return (BL.fromChunks (reverse acc))
+        else do
+          let delay = mkDelay chunkSize kbps
+          r <- liftIO $ randomRIO (0, 99 :: Int)
+          liftIO $ threadDelay delay
+          when (r < dis) $ do
+            -- Forcefully disconnect by crashing the connection.
+            liftIO $ throwIO $ userError "Simulated disconnect"
+          let acc' = if r < pct then acc else chunk : acc
+          go acc'
 
 -- * Proxy Server
 
@@ -95,26 +104,22 @@ app' upstreamHost manager chan req respond
   | isWebSocket req =
       liftIO . respond $ Wai.responseLBS status501 corsHeaders "WebSocket passthrough should be handled separately"
   | otherwise = do
-      cfg <- ask
       let rawPath = B.unpack $ Wai.rawPathInfo req
           rawQuery = B.unpack $ Wai.rawQueryString req
           fullURL = upstreamHost ++ rawPath ++ rawQuery
 
       liftIO . atomicallyLog chan $ "[Request] " <> T.pack (B.unpack (Wai.requestMethod req)) <> " " <> T.pack rawPath <> T.pack rawQuery
 
-      body <- liftIO $ Wai.strictRequestBody req
-      kbps <- liftIO $ readTVarIO (cfg ^. targetKbps)
-      pct <- liftIO $ readTVarIO (cfg ^. dropPct)
-      throttledBody <- liftIO $ throttleChunks kbps pct $ B.concat $ BL.toChunks body
+      let chunkSize = 1024
+      body <- throttledRequestBody (Wai.getRequestBodyChunk req) chunkSize
 
       initReq <- HC.parseRequest fullURL
       let filteredHeaders = filter (\(h, _) -> CI.foldedCase h `notElem` ["host", "content-length"]) (Wai.requestHeaders req)
-
           req' =
             initReq
               { HC.method = Wai.requestMethod req,
                 HC.requestHeaders = filteredHeaders,
-                HC.requestBody = HC.RequestBodyLBS throttledBody,
+                HC.requestBody = HC.RequestBodyLBS body,
                 HC.responseTimeout = HC.responseTimeoutMicro (60 * 1000000)
               }
 
@@ -154,7 +159,7 @@ wsApp upstreamUrl cfg pending = do
   WS.runClient upstreamHost upstreamPort (B8.unpack fullPath) $ \connUpstream -> runReaderT (wsApp' connClient connUpstream) cfg
 
 wsApp' :: WS.Connection -> WS.Connection -> AppM ()
-wsApp' connClient connUpstream = do
+wsApp' connClient connUpstream =
   liftIO $
     race_
       (forever $ WS.receiveData connClient >>= \(t :: T.Text) -> WS.sendTextData connUpstream t)
@@ -208,14 +213,20 @@ atomicallyLog chan msg = writeBChan chan (LogMsg msg)
 
 -- * Brick UI
 
-data Name = RateLimitInput | DropPercentageInput | LogViewport deriving (Eq, Ord, Show)
+data Name = RateLimitInput | DropPercentageInput | DisconnectLikelihood | LogViewport deriving (Eq, Ord, Show)
 
 data St = St
   { _rateLimitInput :: Editor Text Name,
     _dropPercentageInput :: Editor Text Name,
+    _disconnectLikelihoodInput :: Editor Text Name,
     _logs :: [Text],
     _eventChan :: BChan AppEvent,
     _rateVar :: TVar Int,
+    _currentRate :: Int,
+    _dropVar :: TVar Int,
+    _currentDrop :: Int,
+    _disconnectVar :: TVar Int,
+    _currentDisconnect :: Int,
     _availableHeight :: Int,
     _currentField :: Name
   }
@@ -227,15 +238,23 @@ drawUI st =
   [ vBox
       [ hLimitPercent 100 $
           vBox
-            [ vBox
-                [ borderWithLabel (str "Logs") logViewport,
-                  hBorder
-                ],
+            [ borderWithLabel (str "Logs") logViewport,
               hBox
-                [ borderWithLabel (str "Rate (KBit/s)") $ renderEditor (txt . T.unlines) (st ^. currentField == RateLimitInput) (st ^. rateLimitInput),
-                  borderWithLabel (str "Drop (%) [0-100]") $ renderEditor (txt . T.unlines) (st ^. currentField == DropPercentageInput) (st ^. dropPercentageInput)
+                [ drawPane
+                    (st ^. currentField == RateLimitInput)
+                    ("Rate (KBit/s) [current: " <> showVal (st ^. currentRate) <> "]")
+                    (renderEditor (txt . T.unlines) (st ^. currentField == RateLimitInput) (st ^. rateLimitInput)),
+                  drawPane
+                    (st ^. currentField == DropPercentageInput)
+                    ("Drop (%) [0-100] [current: " <> showVal (st ^. currentDrop) <> "]")
+                    (renderEditor (txt . T.unlines) (st ^. currentField == DropPercentageInput) (st ^. dropPercentageInput)),
+                  drawPane
+                    (st ^. currentField == DisconnectLikelihood)
+                    ("Disconnect (%) [0-100] [current: " <> showVal (st ^. currentDisconnect) <> "]")
+                    (renderEditor (txt . T.unlines) (st ^. currentField == DisconnectLikelihood) (st ^. disconnectLikelihoodInput))
                 ],
-              padTop (Pad 1) $ str "<Enter>: apply highlighted configuration value. <Ctrl-N>: switch input fields. <Ctrl-Q>: quit"
+              hBorder,
+              str "<Enter>: apply highlighted configuration value. <Tab>: switch input fields. <Ctrl-Q>: quit"
             ]
       ]
   ]
@@ -243,36 +262,84 @@ drawUI st =
     logViewport =
       viewport LogViewport Vertical $
         vBox (map (txt . T.stripEnd) (reverse (st ^. logs)))
+    showVal = T.unpack . T.pack . show
+
+paneBorderMappings :: [(AttrName, V.Attr)]
+paneBorderMappings =
+  [ (borderAttr, V.yellow `BU.on` V.black)
+  ]
+
+-- | Helper to draw a pane with a border that changes color if selected.
+drawPane :: Bool -> String -> Widget Name -> Widget Name
+drawPane isSelected label content =
+  if isSelected
+    then updateAttrMap (applyAttrMappings paneBorderMappings) $ borderWithLabel (withAttr (attrName "label") (str label)) content
+    else borderWithLabel (str label) content
 
 handleEvent :: BrickEvent Name AppEvent -> EventM Name St ()
 handleEvent ev = do
-  chan <- gets _eventChan
-  rv <- gets _rateVar
   case ev of
-    AppEvent (LogMsg msg) -> modify \s -> s {_logs = msg : _logs s}
-    AppEvent (ErrorMsg msg) -> modify \s -> s {_logs = "[ERROR]" <> msg : _logs s}
-    VtyEvent (V.EvKey V.KEnter []) -> do
-      input <- gets (T.strip . T.concat . getEditContents . (^. rateLimitInput))
-      case reads (T.unpack input) of
-        [(n :: Int, _)] | n > 0 -> do
-          liftIO . atomically $ writeTVar rv n
-          liftIO . atomicallyLog chan $ "Applied new rate limit: " <> T.pack (show n) <> " KBit/s"
-          modify (rateLimitInput .~ editor RateLimitInput (Just 1) "")
-        _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected a positive integer"
+    AppEvent (LogMsg msg) -> do
+      modify (logs %~ (msg :))
+      vScrollToEnd $ viewportScroll LogViewport
+    AppEvent (ErrorMsg msg) -> do
+      modify (logs %~ ("[ERROR] " <> msg :))
+      vScrollToEnd $ viewportScroll LogViewport
+    VtyEvent (V.EvKey V.KEnter []) -> handleEditorInput =<< gets _currentField
     VtyEvent (V.EvKey (V.KChar 'q') [V.MCtrl]) -> halt
-    VtyEvent (V.EvKey (V.KChar 'n') [V.MCtrl]) -> do
-      current <- gets _currentField
-      case current of
-        RateLimitInput -> do modify (currentField .~ DropPercentageInput)
-        DropPercentageInput -> modify (currentField .~ RateLimitInput)
-        _ -> modify (currentField .~ RateLimitInput)
-    VtyEvent (V.EvResize _ newHeight) -> modify $ \s -> s {_availableHeight = newHeight}
+    VtyEvent (V.EvKey (V.KChar '\t') []) -> switchInput
+    VtyEvent (V.EvResize _ newHeight) -> modify (availableHeight .~ newHeight)
     ev'@(VtyEvent _) ->
       gets _currentField >>= \case
         RateLimitInput -> Brick.zoom rateLimitInput $ handleEditorEvent ev'
         DropPercentageInput -> Brick.zoom dropPercentageInput $ handleEditorEvent ev'
+        DisconnectLikelihood -> Brick.zoom disconnectLikelihoodInput $ handleEditorEvent ev'
         _ -> return ()
     _ -> return ()
+  where
+    switchInput = do
+      current <- gets _currentField
+      case current of
+        RateLimitInput -> modify (currentField .~ DropPercentageInput)
+        DropPercentageInput -> modify (currentField .~ DisconnectLikelihood)
+        DisconnectLikelihood -> modify (currentField .~ RateLimitInput)
+        _ -> modify (currentField .~ RateLimitInput)
+
+handleEditorInput :: Name -> EventM Name St ()
+handleEditorInput RateLimitInput = do
+  input <- gets (T.strip . T.concat . getEditContents . (^. rateLimitInput))
+  chan <- gets _eventChan
+  rv <- gets _rateVar
+  case reads (T.unpack input) of
+    [(n :: Int, _)] | n > 0 -> do
+      liftIO . atomically $ writeTVar rv n
+      liftIO . atomicallyLog chan $ "Applied new rate limit: " <> T.pack (show n) <> " KBit/s"
+      modify (rateLimitInput .~ editor RateLimitInput (Just 1) "")
+      modify (currentRate .~ n)
+    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected a positive integer"
+handleEditorInput DropPercentageInput = do
+  input <- gets (T.strip . T.concat . getEditContents . (^. dropPercentageInput))
+  chan <- gets _eventChan
+  rv <- gets _dropVar
+  case reads (T.unpack input) of
+    [(n :: Int, _)] | n >= 0 && n <= 100 -> do
+      liftIO . atomically $ writeTVar rv n
+      liftIO . atomicallyLog chan $ "Applied new drop percentage: " <> T.pack (show n) <> "%"
+      modify (dropPercentageInput .~ editor DropPercentageInput (Just 1) "")
+      modify (currentDrop .~ n)
+    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected an integer between 0 and 100"
+handleEditorInput DisconnectLikelihood = do
+  input <- gets (T.strip . T.concat . getEditContents . (^. disconnectLikelihoodInput))
+  chan <- gets _eventChan
+  rv <- gets _disconnectVar
+  case reads (T.unpack input) of
+    [(n :: Int, _)] | n >= 0 && n <= 100 -> do
+      liftIO . atomically $ writeTVar rv n
+      liftIO . atomicallyLog chan $ "Applied new disconnect percentage: " <> T.pack (show n) <> "%"
+      modify (disconnectLikelihoodInput .~ editor DisconnectLikelihood (Just 1) "")
+      modify (currentDisconnect .~ n)
+    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected an integer between 0 and 100"
+handleEditorInput _ = return ()
 
 appDef :: App St AppEvent Name
 appDef =
@@ -281,8 +348,18 @@ appDef =
       appChooseCursor = showFirstCursor,
       appHandleEvent = handleEvent,
       appStartEvent = return (),
-      appAttrMap = const $ attrMap V.defAttr []
+      appAttrMap = const theMap
     }
+
+-- | Attribute map to highlight the selected list item and search matches.
+theMap :: AttrMap
+theMap =
+  attrMap
+    V.defAttr
+    [ (attrName "bold", V.withStyle V.defAttr V.bold),
+      (attrName "focused", V.withStyle (V.yellow `BU.on` V.black) V.bold),
+      (attrName "label", V.withStyle (V.yellow `BU.on` V.black) V.bold)
+    ]
 
 main :: IO ()
 main = do
@@ -297,15 +374,28 @@ main = do
       chan <- newBChan 10
       rv <- newTVarIO 2048
       dpct <- newTVarIO 0
-      let conf = ProxyConfig rv dpct 8888
+      dv <- newTVarIO 0
+      let conf =
+            ProxyConfig
+              { _targetKbps = rv,
+                _dropPct = dpct,
+                _disconnectPct = dv,
+                _port = 8888
+              }
       _ <- forkIO $ runProxyServer host chan conf
       let initialState =
             St
               { _rateLimitInput = editor RateLimitInput (Just 1) "",
                 _dropPercentageInput = editor DropPercentageInput (Just 1) "",
+                _disconnectLikelihoodInput = editor DisconnectLikelihood (Just 1) "",
                 _logs = [],
                 _eventChan = chan,
                 _rateVar = rv,
+                _currentRate = 2048,
+                _dropVar = dpct,
+                _currentDrop = 0,
+                _disconnectVar = dv,
+                _currentDisconnect = 0,
                 _availableHeight = height,
                 _currentField = RateLimitInput
               }
