@@ -9,3 +9,15 @@ $ cabal run throttler "http://<your-domain>"
 Runs on `localhost:8888` by default.
 
 All requests made to this server will be throttled configurable via the TUI and forwarded to the given URL. Also works for TUS uploads and WebSockets.
+
+## Commands
+
+- Use `<TAB>` to switch between input fields.
+- **Rate (KBit/s)** - The upload rate targeted. This limits the rate at which the proxy will
+  accept chunks of data from the client in a request. E.g. uppy uploads in multiple PATCH requests.
+  Each PATCH would then be limited with the rate set here.
+- **Drop (%)** - The percentage of requests to drop. The proxy will simply drop the request.
+- **Disconnect (%)** - The probability of disconnecting an accepted request which is currently being
+  processed.
+
+**Everything can be changed at runtime and every request will immediately be affected by the new settings.**
