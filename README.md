@@ -21,3 +21,5 @@ All requests made to this server will be throttled configurable via the TUI and 
   processed.
 
 **Everything can be changed at runtime and every request will immediately be affected by the new settings.**
+
+![img](https://github.com/user-attachments/assets/05f313d2-4646-4d2a-85f8-5abb4108d0fd)
