@@ -3,7 +3,13 @@
 Call with:
 
 ```
-$ cabal run throttler "http://<your-domain>"
+Usage: throttler [-p|--port PORT] UPSTREAM_URLS...
+```
+
+or straight with `cabal`:
+
+```
+$ cabal run throttler -p 8888 "http://127.0.0.1:54321" "http://127.0.0.1:8000"
 ```
 
 Runs on `localhost:8888` by default.
