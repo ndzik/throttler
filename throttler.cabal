@@ -91,6 +91,7 @@ executable throttler
         , data-default
         , mtl
         , vty-unix
+        , optparse-applicative
 
     -- Directories containing source files.
     hs-source-dirs:   app

@@ -3,6 +3,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -Wno-name-shadowing #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 module Main (main) where
@@ -37,14 +38,15 @@ import Network.Wai.Handler.Warp
 import Network.Wai.Handler.WebSockets qualified as WaiWS
 import Network.WebSockets (ConnectionException)
 import Network.WebSockets qualified as WS
-import System.Environment (getArgs)
+import Options.Applicative ((<**>))
+import Options.Applicative qualified as Opt
 import System.Random
 
 -- * Events
 
 data AppEvent
   = LogMsg Text
-  | ErrorMsg Text
+  | AppErrorMsg Text
   deriving (Show)
 
 -- * App Environment
@@ -54,6 +56,8 @@ data ProxyConfig = ProxyConfig
     _dropPct :: TVar Int,
     _disconnectPct :: TVar Int,
     _chunkSize :: Int,
+    _proxyChan :: BChan AppEvent,
+    _host :: Text,
     _port :: Int
   }
 
@@ -101,10 +105,10 @@ app :: String -> HC.Manager -> ProxyConfig -> BChan AppEvent -> Wai.Application
 app upstreamHost manager cfg chan req respond =
   runReaderT (app' upstreamHost manager chan req respond) cfg `catch` \case
     SimulatedDisconnect -> do
-      atomicallyLog chan "[Simulated] Forced client disconnect"
+      atomicallyLog chan $ mkLogMsg "[Simulated] Forced client disconnect" cfg
       respond $ Wai.responseLBS status408 corsHeaders "Simulated broken pipe"
     SimulatedDrop -> do
-      atomicallyLog chan "[Simulated] Forced client disconnect"
+      atomicallyLog chan $ mkLogMsg "[Simulated] Forced client disconnect" cfg
       respond $ Wai.responseLBS status408 corsHeaders "Simulated broken pipe"
 
 app' :: String -> HC.Manager -> BChan AppEvent -> Wai.Request -> (Wai.Response -> IO Wai.ResponseReceived) -> AppM Wai.ResponseReceived
@@ -118,7 +122,7 @@ app' upstreamHost manager chan req respond
           rawQuery = B.unpack $ Wai.rawQueryString req
           fullURL = upstreamHost ++ rawPath ++ rawQuery
 
-      liftIO . atomicallyLog chan $ "[Request] " <> T.pack (B.unpack (Wai.requestMethod req)) <> " " <> T.pack rawPath <> T.pack rawQuery
+      atomicallyLogApp $ "[Request] " <> T.pack (B.unpack (Wai.requestMethod req)) <> " " <> T.pack rawPath <> T.pack rawQuery
 
       -- Simulate full connection drop.
       cfg <- ask
@@ -142,7 +146,7 @@ app' upstreamHost manager chan req respond
         liftIO $
           (Right <$> HC.httpLbs req' manager)
             `catch` ( \e -> do
-                        writeBChan chan $ ErrorMsg (T.pack $ show (e :: HttpException))
+                        writeBChan chan $ AppErrorMsg (T.pack $ show (e :: HttpException))
                         void . liftIO . respond $ Wai.responseLBS status500 corsHeaders "Upstream request failed."
                         return (Left ())
                     )
@@ -180,7 +184,7 @@ wsApp upstreamUrl chan cfg pending = do
     ( \connUpstream ->
         runReaderT (wsApp' connClient connUpstream) cfg
     )
-    `catch` (\(_ :: ConnectionException) -> atomicallyLog chan "[WebSocket] Upstream connection closed")
+    `catch` (\(_ :: ConnectionException) -> atomicallyLog chan $ mkLogMsg "[WebSocket] Upstream connection closed" cfg)
 
 wsApp' :: WS.Connection -> WS.Connection -> AppM ()
 wsApp' connClient connUpstream =
@@ -235,6 +239,15 @@ corsHeaders =
 atomicallyLog :: BChan AppEvent -> Text -> IO ()
 atomicallyLog chan msg = writeBChan chan (LogMsg msg)
 
+atomicallyLogApp :: Text -> AppM ()
+atomicallyLogApp msg = do
+  chan <- asks _proxyChan
+  ask >>= liftIO . writeBChan chan . LogMsg . mkLogMsg msg
+
+mkLogMsg :: Text -> ProxyConfig -> Text
+mkLogMsg msg cfg =
+  "[" <> cfg ^. host <> "] " <> msg
+
 -- * Brick UI
 
 data Name = RateLimitInput | DropPercentageInput | DisconnectLikelihood | LogViewport deriving (Eq, Ord, Show)
@@ -278,7 +291,8 @@ drawUI st =
                     (renderEditor (txt . T.unlines) (st ^. currentField == DisconnectLikelihood) (st ^. disconnectLikelihoodInput))
                 ],
               hBorder,
-              str "<Enter>: apply highlighted configuration value. <Tab>: switch input fields. <Ctrl-Q>: quit"
+              str "<Enter>: apply highlighted configuration value. <Tab>: switch input fields. <Ctrl-Q>: quit",
+              hBorder
             ]
       ]
   ]
@@ -306,7 +320,7 @@ handleEvent ev = do
     AppEvent (LogMsg msg) -> do
       modify (logs %~ (msg :))
       vScrollToEnd $ viewportScroll LogViewport
-    AppEvent (ErrorMsg msg) -> do
+    AppEvent (AppErrorMsg msg) -> do
       modify (logs %~ ("[ERROR] " <> msg :))
       vScrollToEnd $ viewportScroll LogViewport
     VtyEvent (V.EvKey V.KEnter []) -> handleEditorInput =<< gets _currentField
@@ -340,7 +354,7 @@ handleEditorInput RateLimitInput = do
       liftIO . atomicallyLog chan $ "Applied new rate limit: " <> T.pack (show n) <> " KBit/s"
       modify (rateLimitInput .~ editor RateLimitInput (Just 1) "")
       modify (currentRate .~ n)
-    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected a positive integer"
+    _ -> liftIO $ writeBChan chan $ AppErrorMsg "Invalid input: expected a positive integer"
 handleEditorInput DropPercentageInput = do
   input <- gets (T.strip . T.concat . getEditContents . (^. dropPercentageInput))
   chan <- gets _eventChan
@@ -351,7 +365,7 @@ handleEditorInput DropPercentageInput = do
       liftIO . atomicallyLog chan $ "Applied new drop percentage: " <> T.pack (show n) <> "%"
       modify (dropPercentageInput .~ editor DropPercentageInput (Just 1) "")
       modify (currentDrop .~ n)
-    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected an integer between 0 and 100"
+    _ -> liftIO $ writeBChan chan $ AppErrorMsg "Invalid input: expected an integer between 0 and 100"
 handleEditorInput DisconnectLikelihood = do
   input <- gets (T.strip . T.concat . getEditContents . (^. disconnectLikelihoodInput))
   chan <- gets _eventChan
@@ -362,7 +376,7 @@ handleEditorInput DisconnectLikelihood = do
       liftIO . atomicallyLog chan $ "Applied new disconnect percentage: " <> T.pack (show n) <> "%"
       modify (disconnectLikelihoodInput .~ editor DisconnectLikelihood (Just 1) "")
       modify (currentDisconnect .~ n)
-    _ -> liftIO $ writeBChan chan $ ErrorMsg "Invalid input: expected an integer between 0 and 100"
+    _ -> liftIO $ writeBChan chan $ AppErrorMsg "Invalid input: expected an integer between 0 and 100"
 handleEditorInput _ = return ()
 
 appDef :: App St AppEvent Name
@@ -385,44 +399,65 @@ theMap =
       (attrName "label", V.withStyle (V.yellow `BU.on` V.black) V.bold)
     ]
 
+data CLI = CLI
+  { cliBasePort :: Int,
+    cliUpstreams :: [String]
+  }
+
+cliParser :: Opt.Parser CLI
+cliParser =
+  CLI
+    <$> Opt.option Opt.auto (Opt.long "port" <> Opt.short 'p' <> Opt.metavar "PORT" <> Opt.value 8888 <> Opt.showDefault <> Opt.help "Starting port number")
+    <*> Opt.some (Opt.argument Opt.str (Opt.metavar "UPSTREAM_URLS..."))
+
+parseCLI :: IO CLI
+parseCLI = Opt.execParser opts
+  where
+    opts =
+      Opt.info
+        (cliParser <**> Opt.helper)
+        (Opt.fullDesc <> Opt.progDesc "Run multiple throttling proxies" <> Opt.header "throttle-proxy - simulate poor network conditions")
+
 main :: IO ()
 main = do
-  args <- getArgs
+  CLI basePort urls <- parseCLI
 
-  case args of
-    [host] -> do
-      let buildVty = mkVty V.defaultConfig
-      vty <- buildVty
-      (_, height) <- V.displayBounds (V.outputIface vty)
+  chan <- newBChan 10
+  rv <- newTVarIO 2048
+  dpct <- newTVarIO 0
+  dv <- newTVarIO 0
 
-      chan <- newBChan 10
-      rv <- newTVarIO 2048
-      dpct <- newTVarIO 0
-      dv <- newTVarIO 0
-      let conf =
-            ProxyConfig
-              { _targetKbps = rv,
-                _dropPct = dpct,
-                _disconnectPct = dv,
-                _chunkSize = 1024,
-                _port = 8888
-              }
-      _ <- forkIO $ runProxyServer host chan conf
-      let initialState =
-            St
-              { _rateLimitInput = editor RateLimitInput (Just 1) "",
-                _dropPercentageInput = editor DropPercentageInput (Just 1) "",
-                _disconnectLikelihoodInput = editor DisconnectLikelihood (Just 1) "",
-                _logs = [],
-                _eventChan = chan,
-                _rateVar = rv,
-                _currentRate = 2048,
-                _dropVar = dpct,
-                _currentDrop = 0,
-                _disconnectVar = dv,
-                _currentDisconnect = 0,
-                _availableHeight = height,
-                _currentField = RateLimitInput
-              }
-      void $ customMain vty buildVty (Just chan) appDef initialState
-    _ -> putStrLn "Usage: ./proxy <http://upstream-host>"
+  forM_ (zip [basePort ..] urls) $ \(portNumber, upstream) -> do
+    let conf =
+          ProxyConfig
+            { _targetKbps = rv,
+              _dropPct = dpct,
+              _disconnectPct = dv,
+              _chunkSize = 1024,
+              _proxyChan = chan,
+              _host = T.pack upstream,
+              _port = portNumber
+            }
+    _ <- forkIO $ runProxyServer upstream chan conf
+    atomicallyLog chan $ "Started proxy for " <> T.pack upstream <> " on port " <> T.pack (show portNumber)
+
+  let buildVty = mkVty V.defaultConfig
+  vty <- buildVty
+  (_, height) <- V.displayBounds (V.outputIface vty)
+  let initialState =
+        St
+          { _rateLimitInput = editor RateLimitInput (Just 1) "",
+            _dropPercentageInput = editor DropPercentageInput (Just 1) "",
+            _disconnectLikelihoodInput = editor DisconnectLikelihood (Just 1) "",
+            _logs = [],
+            _eventChan = chan,
+            _rateVar = rv,
+            _currentRate = 2048,
+            _dropVar = dpct,
+            _currentDrop = 0,
+            _disconnectVar = dv,
+            _currentDisconnect = 0,
+            _availableHeight = height,
+            _currentField = RateLimitInput
+          }
+  void $ customMain vty buildVty (Just chan) appDef initialState
