@@ -27,6 +27,7 @@ import Data.CaseInsensitive qualified as CI
 import Data.Char (toLower)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Graphics.Vty qualified as V
 import Graphics.Vty.Platform.Unix (mkVty)
 import Network.HTTP.Client (HttpException)
@@ -157,6 +158,13 @@ app' upstreamHost manager chan req respond
           let status = HC.responseStatus resp
               headers = HC.responseHeaders resp
               rawRespBody = HC.responseBody resp
+              prettyBody =
+                case TE.decodeUtf8' . BL.toStrict $ rawRespBody of
+                  Right txt -> txt
+                  Left _ -> T.pack $ show rawRespBody
+
+          -- Log status and body.
+          atomicallyLogApp $ "[Response] " <> T.pack (show status) <> "\n[BODY] ------\n" <> prettyBody
 
           let ourHost = "http://127.0.0.1:" <> show (cfg ^. port)
           liftIO . respond $
@@ -291,7 +299,7 @@ drawUI st =
                     (renderEditor (txt . T.unlines) (st ^. currentField == DisconnectLikelihood) (st ^. disconnectLikelihoodInput))
                 ],
               hBorder,
-              str "<Enter>: apply highlighted configuration value. <Tab>: switch input fields. <Ctrl-Q>: quit",
+              str "<Enter>: apply highlighted configuration value. <Tab>: switch input fields. <Ctrl-d>: log page down. <Ctrl-u>: log page up. <Ctrl-Q>: quit",
               hBorder
             ]
       ]
@@ -326,6 +334,8 @@ handleEvent ev = do
     VtyEvent (V.EvKey V.KEnter []) -> handleEditorInput =<< gets _currentField
     VtyEvent (V.EvKey (V.KChar 'q') [V.MCtrl]) -> halt
     VtyEvent (V.EvKey (V.KChar '\t') []) -> switchInput
+    VtyEvent (V.EvKey (V.KChar 'u') [V.MCtrl]) -> logViewPageUp
+    VtyEvent (V.EvKey (V.KChar 'd') [V.MCtrl]) -> logViewPageDown
     VtyEvent (V.EvResize _ newHeight) -> modify (availableHeight .~ newHeight)
     ev'@(VtyEvent _) ->
       gets _currentField >>= \case
@@ -342,6 +352,18 @@ handleEvent ev = do
         DropPercentageInput -> modify (currentField .~ DisconnectLikelihood)
         DisconnectLikelihood -> modify (currentField .~ RateLimitInput)
         _ -> modify (currentField .~ RateLimitInput)
+
+logViewPageUp :: EventM Name St ()
+logViewPageUp = do
+  height <- gets _availableHeight
+  let pageHeight = height - 3 - 3 - 2
+  vScrollBy (viewportScroll LogViewport) (-pageHeight)
+
+logViewPageDown :: EventM Name St ()
+logViewPageDown = do
+  height <- gets _availableHeight
+  let pageHeight = height - 3 - 3 - 2
+  vScrollBy (viewportScroll LogViewport) pageHeight
 
 handleEditorInput :: Name -> EventM Name St ()
 handleEditorInput RateLimitInput = do
