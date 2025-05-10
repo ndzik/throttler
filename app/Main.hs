@@ -195,11 +195,20 @@ wsApp upstreamUrl chan cfg pending = do
     `catch` (\(_ :: ConnectionException) -> atomicallyLog chan $ mkLogMsg "[WebSocket] Upstream connection closed" cfg)
 
 wsApp' :: WS.Connection -> WS.Connection -> AppM ()
-wsApp' connClient connUpstream =
+wsApp' connClient connUpstream = do
+  chan <- asks _proxyChan
   liftIO $
     race_
-      (forever $ WS.receiveData connClient >>= \(t :: T.Text) -> WS.sendTextData connUpstream t)
-      (forever $ WS.receiveData connUpstream >>= \(t :: T.Text) -> WS.sendTextData connClient t)
+      (forever $ WS.receiveData connClient >>= teeWebSocket chan "[FromClient]" connUpstream)
+      (forever $ WS.receiveData connUpstream >>= teeWebSocket chan "[FromUpstream]" connClient)
+
+teeWebSocket :: BChan AppEvent -> T.Text -> WS.Connection -> B.ByteString -> IO ()
+teeWebSocket chan tag conn msg = do
+  let msg' = case TE.decodeUtf8' msg of
+        Right txt -> txt
+        Left _ -> T.pack $ show msg
+  atomicallyLog chan $ "[WebSocket]" <> tag <> " " <> msg'
+  liftIO $ WS.sendTextData conn msg'
 
 -- * Utils
 
