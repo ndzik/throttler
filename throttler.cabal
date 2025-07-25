@@ -70,7 +70,7 @@ executable throttler
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.17.2.1
+    build-depends:    base
         , bytestring
         , http-client
         , http-client-tls
@@ -92,6 +92,7 @@ executable throttler
         , mtl
         , vty-unix
         , optparse-applicative
+        , network
 
     -- Directories containing source files.
     hs-source-dirs:   app

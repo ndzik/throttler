@@ -18,6 +18,7 @@ import Control.Concurrent.Async (race_)
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens (makeLenses, (%~), (.~), (^.))
+import Control.Monad (forM_, forever, void, when)
 import Control.Monad.Reader
 import Data.Bifunctor (first)
 import Data.ByteString.Char8 qualified as B
@@ -114,8 +115,8 @@ app upstreamHost manager cfg chan req respond =
 
 app' :: String -> HC.Manager -> BChan AppEvent -> Wai.Request -> (Wai.Response -> IO Wai.ResponseReceived) -> AppM Wai.ResponseReceived
 app' upstreamHost manager chan req respond
-  | Wai.requestMethod req == "OPTIONS" =
-      liftIO . respond $ Wai.responseLBS status204 corsHeaders ""
+  -- \| Wai.requestMethod req == "OPTIONS" =
+  --     liftIO . respond $ Wai.responseLBS status204 corsHeaders ""
   | isWebSocket req =
       liftIO . respond $ Wai.responseLBS status501 corsHeaders "WebSocket passthrough should be handled separately"
   | otherwise = do
@@ -143,6 +144,8 @@ app' upstreamHost manager chan req respond
                 HC.responseTimeout = HC.responseTimeoutMicro (60 * 1000000)
               }
 
+      atomicallyLogApp $ "[Request] Forwarding to upstream: " <> T.pack fullURL
+      atomicallyLogApp $ "[Request] Headers: " <> T.pack (show filteredHeaders)
       result <-
         liftIO $
           (Right <$> HC.httpLbs req' manager)
